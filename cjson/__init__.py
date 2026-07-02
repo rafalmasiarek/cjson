@@ -25,6 +25,7 @@ from .cjsonl import (
     load_cjsonl,
     load_cjsonl_gzip,
     open_writer,
+    read_footer,
     scan,
     scan_compressed,
     scan_gzip,
@@ -60,7 +61,7 @@ __all__ = [
     "CjsonlMeta", "V1Codec", "register_codec", "get_codec",
     # cjsonl IO
     "Writer", "Reader", "RowReader", "open_writer", "append", "dump_cjsonl", "load_cjsonl",
-    "iter_cjsonl_records", "iter_cjsonl_rows", "seal", "scan",
+    "iter_cjsonl_records", "iter_cjsonl_rows", "seal", "scan", "read_footer",
     "compress_cjsonl", "decompress_cjsonl",
     "iter_cjsonl_compressed_records", "iter_cjsonl_compressed_rows",
     "iter_cjsonl_gzip_records", "iter_cjsonl_gzip_rows", "load_cjsonl_gzip",

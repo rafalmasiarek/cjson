@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .schema import CjsonlError, Schema, SchemaLike, SchemasLike, StringParts
 
@@ -41,6 +41,7 @@ class CjsonlMeta:
     minmax: dict[int, list[Any]] = field(default_factory=dict)
     raw_headers: list[dict[str, Any]] = field(default_factory=list)
     raw_footer: dict[str, Any] | None = None
+    decoders: list[Callable[[Any], Any] | None] = field(default_factory=list)
 
 
 def json_dumps_line(obj: Any) -> str:
@@ -130,6 +131,7 @@ def _build_meta_from_schema(schema: Schema | None, header: Mapping[str, Any]) ->
                 strict=bool(spec.get("strict", True)),
                 store_in_header=True,
             )
+    _build_decoders(meta)
     return meta
 
 
@@ -194,6 +196,47 @@ def make_header(schema: Schema | None, columns: list[str], *, codec: str | None 
     return header
 
 
+def _make_decoder(pos: int, meta: CjsonlMeta) -> Callable[[Any], Any] | None:
+    """Build a single decode closure for one column position. Returns None for plain columns."""
+    has_default = pos in meta.defaults
+    default_val = meta.defaults.get(pos)
+    default_marker = meta.default_markers.get(pos, 0)
+    base = meta.bases.get(pos)
+    is_bool = pos in meta.bool_positions
+    alias = meta.alias_decode.get(pos)
+    parts = meta.string_parts.get(pos)
+    transform = meta.transforms.get(pos)
+    has_decode = transform is not None and transform.decode is not None
+
+    if not any([has_default, base is not None, is_bool, alias, parts, has_decode]):
+        return None
+
+    def decoder(value: Any) -> Any:
+        if has_default and value == default_marker:
+            return default_val
+        if base is not None and value is not None:
+            try:
+                value = base + value
+            except TypeError:
+                pass
+        if is_bool and value is not None:
+            value = bool(value)
+        if alias is not None:
+            value = alias.get(value, value)
+        if parts is not None:
+            value = parts.decode_value(value)
+        if has_decode:
+            value = transform.decode(value)  # type: ignore[union-attr]
+        return value
+
+    return decoder
+
+
+def _build_decoders(meta: CjsonlMeta) -> None:
+    """Precompile per-column decode closures once per header read."""
+    meta.decoders = [_make_decoder(pos, meta) for pos in range(len(meta.columns))]
+
+
 def encode_cell(value: Any, pos: int, meta: CjsonlMeta, *, missing: bool = False) -> Any:
     if missing:
         value = meta.defaults.get(pos)
@@ -225,26 +268,25 @@ def encode_cell(value: Any, pos: int, meta: CjsonlMeta, *, missing: bool = False
 
 
 def decode_cell(value: Any, pos: int, meta: CjsonlMeta) -> Any:
+    if meta.decoders:
+        d = meta.decoders[pos] if pos < len(meta.decoders) else None
+        return d(value) if d is not None else value
+    # Fallback for bare CjsonlMeta (scan path, no schema).
     if pos in meta.defaults and value == meta.default_markers.get(pos, 0):
         return meta.defaults[pos]
-
     if pos in meta.bases and value is not None:
         try:
             value = meta.bases[pos] + value
         except TypeError:
             pass
-
     if pos in meta.bool_positions and value is not None:
         value = bool(value)
-
     alias = meta.alias_decode.get(pos)
     if alias is not None:
         value = alias.get(value, value)
-
     parts = meta.string_parts.get(pos)
     if parts is not None:
         value = parts.decode_value(value)
-
     transform = meta.transforms.get(pos)
     if transform is not None and transform.decode is not None:
         value = transform.decode(value)
@@ -261,13 +303,25 @@ def encode_record(record: Mapping[str, Any], meta: CjsonlMeta) -> list[Any]:
 
 def decode_row(row: list[Any], meta: CjsonlMeta) -> dict[str, Any]:
     record: dict[str, Any] = {}
-    for pos, column in enumerate(meta.columns):
-        if pos < len(row):
-            record[column] = decode_cell(row[pos], pos, meta)
-        elif pos in meta.defaults:
-            record[column] = meta.defaults[pos]
-        else:
-            record[column] = None
+    row_len = len(row)
+    decoders = meta.decoders
+    if decoders:
+        for pos, column in enumerate(meta.columns):
+            if pos < row_len:
+                d = decoders[pos]
+                record[column] = d(row[pos]) if d is not None else row[pos]
+            elif pos in meta.defaults:
+                record[column] = meta.defaults[pos]
+            else:
+                record[column] = None
+    else:
+        for pos, column in enumerate(meta.columns):
+            if pos < row_len:
+                record[column] = decode_cell(row[pos], pos, meta)
+            elif pos in meta.defaults:
+                record[column] = meta.defaults[pos]
+            else:
+                record[column] = None
     return record
 
 
@@ -340,8 +394,32 @@ def get_codec(codec_id: str | None = None) -> V1Codec:
     return _CODEC_REGISTRY.get(codec_id)
 
 
-def context_from_schema(schema: Schema | None, columns: list[str], *, codec_id: str | None = None) -> CjsonlMeta:
-    """Build an in-memory write context directly from a Schema object."""
+# Cache write-context templates keyed on (schema_id, columns_tuple, codec_id).
+# Only populated for schemas with a stable id; schema-less contexts are not cached.
+_META_TEMPLATE_CACHE: dict[tuple, CjsonlMeta] = {}
+
+
+def _clone_meta_for_write(template: CjsonlMeta) -> CjsonlMeta:
+    """Shallow clone: share immutable encoding fields, reset mutable write state."""
+    return CjsonlMeta(
+        version=template.version,
+        codec=template.codec,
+        schema_id=template.schema_id,
+        columns=template.columns,
+        bases=template.bases,
+        defaults=template.defaults,
+        default_markers=template.default_markers,
+        bool_positions=template.bool_positions,
+        alias_encode=template.alias_encode,
+        alias_decode=template.alias_decode,
+        transforms=template.transforms,
+        string_parts=template.string_parts,
+        decoders=template.decoders,
+        # count, minmax, sealed, raw_headers, raw_footer → fresh defaults
+    )
+
+
+def _build_write_context(schema: Schema | None, columns: list[str], codec_id: str | None) -> CjsonlMeta:
     header: dict[str, Any] = {V: 1}
     if codec_id:
         header[F] = codec_id
@@ -352,3 +430,15 @@ def context_from_schema(schema: Schema | None, columns: list[str], *, codec_id: 
     meta = _build_meta_from_schema(schema, header)
     meta.columns = columns
     return meta
+
+
+def context_from_schema(schema: Schema | None, columns: list[str], *, codec_id: str | None = None) -> CjsonlMeta:
+    """Build an in-memory write context. Cached per (schema.id, columns, codec_id)."""
+    if schema is not None and schema.id is not None:
+        key = (schema.id, tuple(columns), codec_id)
+        template = _META_TEMPLATE_CACHE.get(key)
+        if template is None:
+            template = _build_write_context(schema, columns, codec_id)
+            _META_TEMPLATE_CACHE[key] = template
+        return _clone_meta_for_write(template)
+    return _build_write_context(schema, columns, codec_id)
